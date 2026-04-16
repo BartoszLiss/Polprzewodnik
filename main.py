@@ -1,4 +1,5 @@
 def main():
+    print("AAAAAAAAAAAAAAAAA")
     Nanostructure()
     ManyBody()
     return
