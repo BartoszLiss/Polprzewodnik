@@ -99,6 +99,9 @@ def Nanostructure():
     print("⏳ Solving eigenproblem...")
     eigvals, eigvecs = spla.eigsh(H, k=3, which='SA')
 
+    e = 1.602e-19
+    eigvals_eV = eigvals / e
+
     # NORMALIZE
     def normalize(psi):
         norm = np.sum(np.abs(psi)**2) * dx**3
@@ -110,7 +113,7 @@ def Nanostructure():
     # SAVE (opcjonalnie)
     np.savetxt(os.path.join(output_dir, "energies.dat"), eigvals)
 
-    return eigvals, psi
+    return eigvals_eV, psi
 
 
 # =========================
