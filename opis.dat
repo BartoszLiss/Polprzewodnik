@@ -1,0 +1,10 @@
+| Kolumna | Opis                      |   |   |
+| ------- | ------------------------- | - | - |
+| x[m]    | współrzędna x (metry)     |   |   |
+| y[m]    | współrzędna y (metry)     |   |   |
+| z[m]    | współrzędna z (metry)     |   |   |
+| Re(psi) | część rzeczywista ψ       |   |   |
+| Im(psi) | część urojona ψ           |   |   |
+| density | gęstość ρ =               | ψ | ² |
+| V[J]    | potencjał w danym punkcie |   |   |
+
