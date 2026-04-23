@@ -1,7 +1,5 @@
 
-def main():
-    ManyBody()
-=======
+import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 import matplotlib
@@ -20,8 +18,6 @@ def main():
     energies, psi = Nanostructure()
     Vmn = Coulomb(psi)
     ManyBody(energies, Vmn)
-
->>>>>>> dceb9a2 (poboczny)
     return
 
 
@@ -128,11 +124,7 @@ def Coulomb(Psi):
 # =========================
 # MANY BODY
 # =========================
-def ManyBody(energies, Vmn):
-    print("🧠 ManyBody not implemented yet")
-    return
 
-<<<<<<< HEAD
 def ManyBody(basis_size=0, single_eigval=0, single_eigvec=0, coul_matrix=0):
     #Znajduje energie układu wielocząstkowego
     basis_cutoff = 10 
@@ -151,8 +143,6 @@ def ManyBody(basis_size=0, single_eigval=0, single_eigvec=0, coul_matrix=0):
     basis = np.array(basis)
     print(basis)
     return
-=======
->>>>>>> dceb9a2 (poboczny)
 
 # =========================
 if __name__ == "__main__":
