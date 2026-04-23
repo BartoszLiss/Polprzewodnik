@@ -8,18 +8,33 @@ import matplotlib.pyplot as plt
 import os
 import json
 import time
+from vmc_engine import run_vmc, VMCConfig
 
 # =========================
 # MAIN
 # =========================
 def main():
-    print("AAAAAAAAAAAAAAAAA")
+    print("🚀 Uruchamiam zintegrowany system FDM + VMC")
 
-    energies, psi = Nanostructure()
-    Vmn = Coulomb(psi)
-    ManyBody(energies, Vmn)
-    return
+    # 1. Odbieramy komplet danych z solvera Bartka
+    # Zauważ, że x, y, z też odbieramy, żeby mieć pewność, że siatki się zgadzają
+    energies, psi, V, x, y, z = Nanostructure()
+    
+    # 2. Konfiguracja Twojego silnika VMC
+    from vmc_engine import run_vmc, VMCConfig
+    
+    cfg = VMCConfig(
+        n_walkers = 2048, 
+        n_steps = 5000,
+        verbose = True
+    )
 
+    # 3. Odpalenie obliczeń
+    # Przekazujemy psi, V oraz siatkę x, y, z
+    result = run_vmc(psi, V, x, y, z, energies[0], cfg)
+
+    print(f"\n🎯 FINALNY WYNIK:")
+    print(f"Energia stanu podstawowego (2e): {result['energy_mean']:.4f} eV")
 
 # =========================
 # NANOSTRUCTURE
@@ -110,7 +125,7 @@ def Nanostructure():
     # SAVE (opcjonalnie)
     np.savetxt(os.path.join(output_dir, "energies.dat"), eigvals)
 
-    return eigvals, psi
+    return eigvals, psi, V, x, y, z
 
 
 # =========================
