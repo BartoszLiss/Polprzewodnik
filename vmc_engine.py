@@ -1,135 +1,259 @@
 """
-vmc_module.py — Variational Monte Carlo dla dwóch elektronów w kropce kwantowej
-=================================================================================
-Podłącz ten moduł bezpośrednio pod solver FDM (twój obecny kod).
-Na końcu tego pliku znajduje się przykład integracji.
+vmc_engine.py — Variational Monte Carlo dla dwóch elektronów w kropce kwantowej GaAs/AlAs
+===========================================================================================
 
-Architektura:
-  1. RegularGridInterpolator  → psi(r) w punkcie ciągłym
-  2. Funkcja falowa próbna    → Psi(r1,r2) = psi(r1)*psi(r2)*J(r12)
-  3. Metropolis (wektoryzacja): N_walkers próbkowanych równolegle w NumPy
-  4. Energia lokalna          → E_kin(FDM) + V_ext + V_Coulomb
-  5. Wynik                    → <E> ± błąd statystyczny
+MATEMATYCZNE PODSTAWY 
+---------------------------------------
 
-GPU: zmień `import numpy as np` → `import cupy as np` (jeden przełącznik).
+Szukamy wartości oczekiwanej energii układu dwóch elektronów:
+
+    <E> = <Ψ|Ĥ|Ψ> / <Ψ|Ψ>
+
+gdzie Hamiltonian dwuciałowy to:
+
+    Ĥ = T̂₁ + T̂₂ + V_ext(r₁) + V_ext(r₂) + V_C(r₁₂)
+
+    T̂ᵢ = -ℏ²/(2m) ∇²ᵢ           (energia kinetyczna i-tego elektronu)
+    V_ext(r)  = potencjał studni kwantowej (0 wewnątrz, V₀ na zewnątrz)
+    V_C(r₁₂) = e²/(4πε·r₁₂)     (odpychanie Coulomba, r₁₂ = |r₁ - r₂|)
+
+
+KLUCZOWY TRIK VMC: "Energia Lokalna"
+--------------------------------------
+
+Zamiast liczyć całkę 6D bezpośrednio, zapisujemy:
+
+    <E> = ∫ |Ψ(r₁,r₂)|² · E_L(r₁,r₂) dr₁dr₂
+           ─────────────────────────────────────
+                  ∫ |Ψ(r₁,r₂)|² dr₁dr₂
+
+gdzie ENERGIA LOKALNA to:
+
+    E_L(r₁,r₂) = Ĥ·Ψ(r₁,r₂) / Ψ(r₁,r₂)
+
+Teraz <E> = E[E_L] = wartość oczekiwana E_L pod miarą |Ψ|²/⟨Ψ|Ψ⟩.
+
+To jest całka 6D, ale szacujemy ją metodą Monte Carlo:
+    → próbkujemy (r₁,r₂) z rozkładu |Ψ|² (algorytm Metropolisa)
+    → liczymy średnią arytmetyczną E_L po próbkach
+
+Błąd statystyczny spada jak 1/√N — nie jak 2^(-6N) jak w metodach siatki.
+
+
+FUNKCJA PRÓBNA (Trial Wavefunction)
+-------------------------------------
+
+Wybieramy postać:
+
+    Ψ(r₁,r₂) = φ(r₁) · φ(r₂) · J(r₁₂)
+
+gdzie:
+  φ(r)   = jednocząstkowa funkcja falowa z solvera FDM (interpolowana z siatki)
+  J(r₁₂) = czynnik Jastrowa — modeluje korelację elektronową
+
+Czynnik Jastrowa (forma Padé, spełnia "cusp condition"):
+
+    J(r₁₂) = exp( r₁₂ / (2·(1 + α·r₁₂)) )
+
+    Uwaga o znaku: wykładnik jest DODATNI przy małych r₁₂
+    (elektrony "unikają się nawzajem" — Ψ rośnie gdy są daleko).
+
+    Warunek graniczny (cusp condition dla spinów antyrównoległych):
+        dJ/dr₁₂|_{r₁₂→0} = J(0)/2  ✓
+
+
+PEŁNY LAPLASJIAN FUNKCJI PRÓBNEJ
+----------------------------------
+
+To jest najważniejsza poprawka względem wersji naiwnej.
+Człon kinetyczny wymaga ∇²Ψ/Ψ, nie ∇²φ/φ.
+
+Niech f = φ(r₁)·φ(r₂), g = J(r₁₂). Wtedy Ψ = f·g.
+
+Laplasjian po r₁:
+
+    ∇²_{r₁} Ψ = (∇²_{r₁} φ₁)·φ₂·g + φ₁·φ₂·∇²_{r₁} g + 2(∇_{r₁} φ₁)·φ₂·(∇_{r₁} g)
+
+Dzieląc przez Ψ = φ₁·φ₂·g:
+
+    ∇²_{r₁} Ψ / Ψ = (∇²φ₁/φ₁) + (∇²_{r₁} g/g) + 2·(∇φ₁/φ₁)·(∇_{r₁} g/g)
+
+Analogicznie dla r₂ (z ∇_{r₂} g = -∇_{r₁} g, bo g zależy od r₁₂ = r₁ - r₂).
+
+Pochodne Jastrowa (obliczane analitycznie — szybciej i dokładniej niż FDM):
+
+    Niech u(r) = r/(2(1+αr)), wtedy J = exp(u).
+
+    du/dr = 1 / (2·(1+αr)²)
+
+    ∇_{r₁} g/g = (du/dr₁₂) · r̂₁₂    gdzie r̂₁₂ = (r₁-r₂)/r₁₂
+
+    ∇²_{r₁} g/g = (d²u/dr²)|_{r₁₂} + (du/dr)|²_{r₁₂} + (2/r₁₂)·(du/dr)|_{r₁₂}
+                    (składnik radilanego laplasjanu w 3D)
+
+
+ALGORYTM METROPOLISA-HASTINGSA
+--------------------------------
+
+Próbkuje z |Ψ|²  bez liczenia stałej normalizacji:
+
+    1. Zacznij od konfiguracji (r₁, r₂)
+    2. Zaproponuj nową: r₁' = r₁ + δ·η, r₂' = r₂ + δ·η  (η ~ N(0,1))
+    3. Oblicz ratio: A = |Ψ(r₁',r₂')|²/|Ψ(r₁,r₂)|²
+    4. Akceptuj z prawdopodobieństwem min(1, A)
+    5. Zbieraj E_L dla zaakceptowanych (i odrzuconych!) konfiguracji
+
+Wektoryzacja: N_walkers konfiguracji aktualizowanych JEDNOCZEŚNIE przez NumPy.
 """
 
 import numpy as np
 import scipy.interpolate as si
-import scipy.ndimage as snd          # do numerycznego laplasjanu na siatce
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Tuple
 import time
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1.  STAŁE FIZYCZNE (SI)
+# STAŁE FIZYCZNE (SI)
 # ─────────────────────────────────────────────────────────────────────────────
 
-E_CHARGE   = 1.602176634e-19   # [C]
-HBAR       = 1.054571817e-34   # [J·s]
-M_E        = 9.1093837015e-31  # [kg]
-EPS_0      = 8.8541878128e-12  # [F/m]
+E_CHARGE = 1.602176634e-19   # ładunek elektronu [C]
+HBAR     = 1.054571817e-34   # stała Plancka/2π [J·s]
+M_E      = 9.1093837015e-31  # masa elektronu [kg]
+EPS_0    = 8.8541878128e-12  # przenikalność próżni [F/m]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2.  KONFIGURACJA VMC
+# KONFIGURACJA VMC
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class VMCConfig:
-    """Wszystkie hiperparametry algorytmu w jednym miejscu."""
+    """
+    Wszystkie hiperparametry algorytmu w jednym miejscu.
 
-    # Czynnik Jastrowa:  J(r12) = exp(-alpha * r12 / (1 + beta*r12))
-    # alpha ≈ 1/2 dla spinów antyrównoległych (warunek kąta chusteczkowego)
-    jastrow_alpha: float = 0.5
-    jastrow_beta:  float = 1.0           # [1/m] — skaluje zasięg korelacji
+    Parametr Jastrowa α kontroluje siłę korelacji:
+        α → 0  : J → 1  (brak korelacji, wynik = 2·E_1cząstk)
+        α → ∞  : silna korelacja, elektrony mocno się unikają
+    Optymalną α wyznaczamy minimalizując <E> (zasada wariacyjna:
+        <E>[Ψ_trial] ≥ E_dokładne, więc minimum <E> = najlepsze przybliżenie).
+    """
+
+    # Czynnik Jastrowa: J(r₁₂) = exp(r₁₂ / (2·(1 + α·r₁₂)))
+    jastrow_alpha: float = 1e8        # [1/m] — parametr wariacyjny, OPTYMALIZOWANY
 
     # Metropolis
-    n_walkers:     int   = 2048          # ile konfiguracji równolegle
-    step_size:     float = 2.0e-10       # [m] — krok propozycji (≈ 0.4 * dx)
-    n_warmup:      int   = 500           # kroki rozgrzewkowe (odrzucamy)
-    n_steps:       int   = 5000          # kroki produkcyjne
-    target_ar:     float = 0.50          # pożądany acceptance rate
+    n_walkers:  int   = 2048          # liczba równoległych konfiguracji
+    step_size:  float = 2.0e-10       # δ — krok propozycji [m], ≈ 0.4·dx
+    n_warmup:   int   = 500           # kroki termalizacji (odrzucane)
+    n_steps:    int   = 5000          # kroki produkcyjne (zbieramy E_L)
+    target_ar:  float = 0.50          # docelowy acceptance rate (0.4-0.6 = optymalny)
 
-    # Energia lokalna — różniczka numeryczna ∇²ψ
-    fdm_delta:     float = 1e-11         # [m] — krok finitny do laplasjanu
+    # Różniczkowanie numeryczne ∇²φ/φ (krok stencila)
+    fdm_delta:  float = 1e-11         # [m], powinno być << dx ale >> błąd numeryczny
 
-    # Przenikalność elektryczna (GaAs: eps_r ≈ 12.9)
-    eps_r:         float = 12.9
-
-    # Masy efektywne (można nadpisać po inicjalizacji)
-    m_eff_in:      float = 0.067 * M_E  # GaAs
-    m_eff_out:     float = 0.15  * M_E  # AlAs
+    # Materiał: GaAs/AlAs
+    eps_r:      float = 12.9          # przenikalność względna GaAs (bezwymiarowa)
+    m_eff:      float = 0.067 * M_E  # masa efektywna elektronu w GaAs [kg]
 
     # Opcje
-    adaptive_step: bool  = True          # auto-dostrajanie step_size
-    verbose:       bool  = True
+    adaptive_step: bool = True        # czy auto-dostrajać step_size podczas warmup
+    verbose:       bool = True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3.  INTERPOLATOR  ψ(r)  na siatce → wartość ciągła
+# INTERPOLATOR φ(r) — siatka dyskretna → wartość ciągła
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PsiInterpolator:
     """
     Opakowuje scipy.interpolate.RegularGridInterpolator.
 
-    Wejście:  psi [nx,ny,nz], x/y/z w metrach
-    Wyjście:  psi(r) dla tablicy punktów shape (N,3)
+    Problem: solver FDM daje φ tylko na węzłach siatki (nx·ny·nz liczb).
+    Potrzebujemy φ(r) dla DOWOLNEGO r ∈ ℝ³ (walkery lądują gdziekolwiek).
+
+    Rozwiązanie: interpolacja trójliniowa między węzłami.
+
+    Wejście konstruktora:
+        psi : array (nx, ny, nz) — jednocząstkowa f. falowa z FDM
+        x, y, z : array 1D — współrzędne siatki [m]
+
+    Wywołanie: psi_itp(r) gdzie r ma shape (..., 3)
     """
 
     def __init__(self, psi: np.ndarray, x: np.ndarray,
                  y: np.ndarray, z: np.ndarray):
-        # Interpolator działa na |ψ|  (zawsze rzeczywista, ∝ gęstość)
-        # Używamy psi.real — zakładamy, że solver zwraca realne wektory własne
+        # Używamy psi.real (eigvecs mogą być zespolone z powodów numerycznych,
+        # ale dla potencjału rzeczywistego wybieramy realne reprezentanty)
         self._itp = si.RegularGridInterpolator(
             (x, y, z), psi.real,
-            method="linear",       # szybkie; "cubic" dokładniejsze ale wolne
+            method="cubic",      # linear - trójliniowa — szybka, C¹ wewnątrz komórki cubic
             bounds_error=False,
-            fill_value=0.0,        # poza siatką → ψ=0 (bariera zewnętrzna)
+            fill_value=0.0,       # poza siatką φ = 0 (bariera jest nieskończona)
         )
-        self.x_range = (x[0], x[-1])
-        self.y_range = (y[0], y[-1])
-        self.z_range = (z[0], z[-1])
+        self.x_range = (float(x[0]), float(x[-1]))
+        self.y_range = (float(y[0]), float(y[-1]))
+        self.z_range = (float(z[0]), float(z[-1]))
 
     def __call__(self, r: np.ndarray) -> np.ndarray:
         """
-        r : shape (..., 3) — współrzędne [m]
-        zwraca: shape (...)  — wartości ψ(r)
+        r : shape (..., 3)
+        zwraca: φ(r), shape (...)
         """
         shape_in = r.shape[:-1]
-        pts = r.reshape(-1, 3)
-        vals = self._itp(pts)
+        vals = self._itp(r.reshape(-1, 3))
         return vals.reshape(shape_in)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4.  CZYNNIK JASTROWA
+# CZYNNIK JASTROWA i jego pochodne (ANALITYCZNE)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def jastrow(r12: np.ndarray, alpha: float, beta: float) -> np.ndarray:
+def jastrow_and_derivs(r12: np.ndarray, alpha: float):
     """
-    J(r12) = exp(-alpha * r12 / (1 + beta*r12))
+    Oblicza czynnik Jastrowa i jego pochodne analitycznie.
 
-    Spełnia warunek kąta chusteczkowego dla coulombowskiego oddziaływania.
-    r12 : shape (...) — odległość między elektronami [m]
+    Forma: J(r) = exp( u(r) ),  u(r) = r / (2·(1 + α·r))
+
+    Pochodna:      du/dr = 1 / (2·(1+αr)²)
+    Druga pochodna: d²u/dr² = -α / (1+αr)³
+
+    Argumenty:
+        r12   : array (...) — odległość |r₁ - r₂| [m], musi być > 0
+        alpha  : parametr wariacyjny [1/m]
+
+    Zwraca tuple:
+        J       : exp(u),         shape (...)
+        du_dr   : du/dr,          shape (...)   — potrzebne do członu gradientowego
+        d2u_dr2 : d²u/dr²,        shape (...)   — potrzebne do członu laplasjanu
     """
-    return np.exp(-alpha * r12 / (1.0 + beta * r12))
+    denom  = 1.0 + alpha * r12          # (1 + αr)
+    u      = r12 / (2.0 * denom)        # u(r) = r/(2(1+αr))
+    J      = np.exp(u)                  # czynnik Jastrowa
+    du_dr  = 1.0 / (2.0 * denom**2)    # du/dr
+    d2u_dr2 = -alpha / denom**3         # d²u/dr²
+
+    return J, du_dr, d2u_dr2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5.  FUNKCJA FALOWA PRÓBNA  Ψ_trial(r1, r2)
+# FUNKCJA PRÓBNA Ψ(r₁, r₂)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TrialWavefunction:
     """
-    Ψ(r1, r2) = ψ(r1) · ψ(r2) · J(r12)
+    Ψ(r₁, r₂) = φ(r₁) · φ(r₂) · J(r₁₂)
 
-    Zakłada, że orbitalny ψ pochodzi z solvera jednocząstkowego (FDM).
-    Elektronom przypisujemy singletowy spin (antysymm. spinowa → sym. orbitalnie),
-    więc część orbitalna jest symetryczna — iloczyn orbitali to poprawna
-    funkcja wejściowa do korekty korelacyjnej przez Jastrow.
+    Własności:
+    - Symetryczna względem zamiany r₁↔r₂ (elektrony w stanie singletowym
+      mają antysymetryczny spin → część orbitalna musi być symetryczna)
+    - Spełnia cusp condition Kato: dΨ/dr₁₂|_{r₁₂→0} = Ψ(0)/2  ← dzięki J
+    - Czynnik Jastrowa modeluje korelację: dwa elektrony "unikają się"
+      bardziej niż przewiduje przybliżenie Hartree (φ₁·φ₂)
+
+    Sens fizyczny α:
+        Większe α  → silniejsza korelacja → elektrony dalej od siebie
+        α = 0      → Ψ = φ₁·φ₂, brak korelacji (niezależne elektrony)
     """
 
     def __init__(self, psi_itp: PsiInterpolator, cfg: VMCConfig):
@@ -138,121 +262,237 @@ class TrialWavefunction:
 
     def __call__(self, r1: np.ndarray, r2: np.ndarray) -> np.ndarray:
         """
-        r1, r2 : shape (N_walkers, 3)
-        zwraca: Ψ(r1, r2)  shape (N_walkers,)
+        r1, r2 : shape (N, 3)
+        zwraca: Ψ(r₁,r₂), shape (N,)
         """
-        p1  = self.psi(r1)                              # (N,)
-        p2  = self.psi(r2)                              # (N,)
-        dr  = r1 - r2                                   # (N,3)
-        r12 = np.sqrt(np.sum(dr**2, axis=-1)) + 1e-30  # (N,)  unikamy 0
-        J   = jastrow(r12, self.cfg.jastrow_alpha, self.cfg.jastrow_beta)
-        return p1 * p2 * J
+        phi1  = self.psi(r1)
+        phi2  = self.psi(r2)
+        dr    = r1 - r2
+        r12   = np.sqrt(np.sum(dr**2, axis=-1)) + 1e-30   # unikamy 0
+        J, _, _ = jastrow_and_derivs(r12, self.cfg.jastrow_alpha)
+        return phi1 * phi2 * J
 
     def log_abs_sq(self, r1: np.ndarray, r2: np.ndarray) -> np.ndarray:
         """
-        Logarytm |Ψ|² — numerycznie stabilny dla acceptance ratio w Metropolis.
+        Logarytm |Ψ|² — stabilny numerycznie dla acceptance ratio.
+
+        Metropolis wymaga tylko stosunku |Ψ_nowe|²/|Ψ_stare|², który
+        w przestrzeni log to różnica. Unikamy przez to błędów underflow
+        gdy Ψ ≈ 0 (elektrony blisko węzłów φ).
         """
         psi_val = self(r1, r2)
         return 2.0 * np.log(np.abs(psi_val) + 1e-300)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6.  ENERGIA LOKALNA
+# ENERGIA LOKALNA — serce obliczeń VMC
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LocalEnergy:
     """
-    E_L(r1,r2) = E_kin(r1) + E_kin(r2) + V_ext(r1) + V_ext(r2) + V_coul(r12)
+    E_L(r₁,r₂) = ĤΨ(r₁,r₂) / Ψ(r₁,r₂)
 
-    Człon kinetyczny wyznaczamy ze wzoru:
-        E_kin(r) = -ℏ²/(2m) · ∇²ψ(r) / ψ(r)
+    Rozkładamy Hamiltonian:
+        E_L = E_kin,1 + E_kin,2 + V_ext(r₁) + V_ext(r₂) + V_Coulomb(r₁₂)
 
-    ∇²ψ aproksymujemy 6-punktowym stencil finitnym w punkcie ciągłym
-    (jest to konieczne bo interpolujemy ψ poza siatką).
+    ──────────────────────────────────────────────────────────────────────────
+    CZŁON KINETYCZNY — WAŻNA POPRAWKA
+    ──────────────────────────────────────────────────────────────────────────
 
-    Alternatywnie (szybciej):  jeśli punkt leży dokładnie na węźle siatki,
-    można użyć wartości z solvera  H·psi_vec = E·psi_vec:
-        -ℏ²/(2m)·∇²ψ_n = (E_n - V_n)·ψ_n
-    → czyli E_kin(r_n) = E_n - V(r_n).
-    Tutaj implementujemy wersję finitną (działa w dowolnym punkcie).
+    Naiwnie można by myśleć: E_kin,1 = -ℏ²/(2m) · ∇²φ(r₁)/φ(r₁)
+    To BYŁOBY BŁĘDEM. Ψ = φ₁·φ₂·J, więc ∇²_{r₁}Ψ ≠ (∇²φ₁)·φ₂·J.
+
+    Poprawna reguła różniczkowania dla Ψ = f·g (f=φ₁φ₂, g=J):
+
+        ∇²_{r₁}Ψ / Ψ  =  ∇²φ₁/φ₁  +  ∇²_{r₁}J/J  +  2·(∇φ₁/φ₁)·(∇_{r₁}J/J)
+
+    Trzy człony:
+      [A] ∇²φ₁/φ₁       — laplasjian jednocząstkowy (FDM numerycznie)
+      [B] ∇²_{r₁}J/J    — laplasjian Jastrowa po r₁ (ANALITYCZNIE)
+      [C] 2·(∇φ₁/φ₁)·(∇_{r₁}J/J)  — człon mieszany gradient×gradient
+
+    ──────────────────────────────────────────────────────────────────────────
+    POCHODNE JASTROWA (ANALITYCZNE)
+    ──────────────────────────────────────────────────────────────────────────
+
+    J zależy od r₁ tylko przez r₁₂ = |r₁ - r₂|. Oznaczmy r̂ = (r₁-r₂)/r₁₂.
+
+    Gradient:
+        ∇_{r₁}J/J = (du/dr)|_{r₁₂} · r̂₁₂
+
+    Laplasjian radialny w 3D:
+        ∇²_{r₁}J/J = (d²u/dr²)|_{r₁₂} + (du/dr)²|_{r₁₂} + (2/r₁₂)·(du/dr)|_{r₁₂}
+
+    Skąd 2/r₁₂? — to człon kątowy w laplasjanie sferycznym: ∇² = d²/dr² + (2/r)·d/dr
+
+    ──────────────────────────────────────────────────────────────────────────
+    CZŁON COULOMBA — ZAWSZE OBECNY
+    ──────────────────────────────────────────────────────────────────────────
+
+        V_C(r₁₂) = e² / (4πε·r₁₂)
+
+    To jest skalarne oddziaływanie między dwoma elektronami — NIE zanika,
+    NIE jest przybliżone, jest liczone dokładnie dla każdej konfiguracji.
     """
 
-    def __init__(self, psi_itp: PsiInterpolator, V_itp, cfg: VMCConfig,
-                 eigval: float):
+    def __init__(self, psi_itp: PsiInterpolator, V_itp, cfg: VMCConfig):
         self.psi   = psi_itp
-        self.V_itp = V_itp         # interpolator potencjału zewnętrznego
+        self.V_itp = V_itp
         self.cfg   = cfg
-        self.eigval = eigval       # energia własna z FDM (referencja)
 
-    def _laplacian_psi(self, r: np.ndarray) -> np.ndarray:
-        """
-        Numeryczny laplasjian ψ w punktach r (N,3) metodą 6-kierunkowego stencila.
-        Zwraca (∇²ψ)(r) shape (N,).
-        """
-        d = self.cfg.fdm_delta
-        psi_c = self.psi(r)                         # ψ(r),  (N,)
-        lap = -6.0 * psi_c
+    # ── Laplasjian ∇²φ/φ (numeryczny, 6-kierunkowy stencil) ──────────────
 
-        offsets = np.array([
+    def _laplacian_phi_over_phi(self, r: np.ndarray) -> np.ndarray:
+        """
+        Numeryczne ∇²φ(r)/φ(r) metodą 6-punktowego stencila finitnego.
+
+        Stencil: ∇²f ≈ (f(r+δx̂) + f(r-δx̂) + ... - 6f(r)) / δ²
+
+        Uwaga: używamy δ << dx, ale δ nie może być za małe
+        (błąd zaokrąglenia rośnie jak ~ε_mach/δ²).
+        Optymalne δ ≈ ε_mach^(1/4) · r_char ≈ 1e-11 m dla r_char ~ 1nm.
+
+        Argumenty:
+            r : shape (N, 3) — pozycje walkerów [m]
+        Zwraca:
+            ∇²φ/φ : shape (N,)
+        """
+        d   = self.cfg.fdm_delta
+        phi = self.psi(r) + 1e-300   # φ(r), unikamy dzielenia przez 0
+
+        lap = -6.0 * phi
+
+        offsets = [
             [d, 0, 0], [-d, 0, 0],
             [0, d, 0], [0, -d, 0],
-            [0, 0, d], [0, 0,-d],
-        ])  # (6,3)
-
+            [0, 0, d], [0, 0, -d],
+        ]
         for off in offsets:
-            lap += self.psi(r + off[None, :])       # (N,)
+            lap += self.psi(r + np.array(off))   # broadcasting: r ma shape (N,3)
 
-        return lap / (d * d)
+        return lap / (d * d * phi)   # ∇²φ/φ, shape (N,)
 
-    def __call__(self, r1: np.ndarray, r2: np.ndarray,
-                 psi_trial: TrialWavefunction) -> np.ndarray:
+    # ── Laplasjian Jastrowa po r₁ (analityczny) ──────────────────────────
+
+    def _jastrow_kinetic_terms(self, r1: np.ndarray, r2: np.ndarray):
         """
-        Oblicza E_L dla wszystkich walkerów jednocześnie.
-        r1, r2 : (N_walkers, 3)
-        zwraca: E_L (N_walkers,)
+        Liczy człony [B] i [C] z rozpisanego ∇²Ψ/Ψ.
+
+        Używamy analitycznych pochodnych J — dokładniej i szybciej niż FDM.
+
+        Zwraca:
+            lap_J_over_J : (∇²_{r₁}J)/J + (∇²_{r₂}J)/J, shape (N,)
+            cross_term   : 2·[(∇φ₁/φ₁)·(∇_{r₁}J/J) + (∇φ₂/φ₂)·(∇_{r₂}J/J)]
         """
-        cfg = self.cfg
-        hbar2_2m1 = HBAR**2 / (2.0 * cfg.m_eff_in)
+        cfg   = self.cfg
+        d_phi = cfg.fdm_delta   # krok do numerycznego gradientu φ
 
-        # ── Człon kinetyczny  -ℏ²/(2m) ∇²ψ/ψ  dla każdego elektronu ──────
-        lap1 = self._laplacian_psi(r1)                   # (N,)
-        lap2 = self._laplacian_psi(r2)                   # (N,)
-        psi1 = self.psi(r1) + 1e-300
-        psi2 = self.psi(r2) + 1e-300
+        dr    = r1 - r2                                          # (N, 3)
+        r12   = np.sqrt(np.sum(dr**2, axis=-1)) + 1e-30         # (N,)
+        r_hat = dr / r12[:, None]                               # (N, 3), wersor r₁-r₂
 
-        # Zakładamy jednorodną masę m_eff_in (wewnątrz kropki).
-        # Dla punktów na zewnątrz możesz użyć m_eff_out — wymaga interpolatora meff.
-        T1 = -hbar2_2m1 * lap1 / psi1                   # (N,)
-        T2 = -hbar2_2m1 * lap2 / psi2                   # (N,)
+        _, du_dr, d2u_dr2 = jastrow_and_derivs(r12, cfg.jastrow_alpha)
 
-        # ── Potencjał zewnętrzny ──────────────────────────────────────────
-        V1 = self.V_itp(r1)                              # (N,)
-        V2 = self.V_itp(r2)                              # (N,)
+        # ─ Człon [B]: ∇²_{r₁}J/J  (= ∇²_{r₂}J/J, bo J zależy od |r₁-r₂|)
+        #
+        # Radialny laplasjian 3D: ∇² = d²/dr² + (2/r)·d/dr  →
+        #   ∇²J/J = d²u/dr² + (du/dr)² + (2/r₁₂)·du/dr
+        #
+        lap_J_over_J_one = d2u_dr2 + du_dr**2 + (2.0 / r12) * du_dr   # (N,)
 
-        # ── Oddziaływanie Coulomba ────────────────────────────────────────
+        # Dla r₂: ∇_{r₂}J = -∇_{r₁}J, więc (∇_{r₂})² ma ten sam laplasjian
+        lap_J_over_J = 2.0 * lap_J_over_J_one   # oba elektrony
+
+        # ─ Człon [C]: gradient φ/φ · gradient J/J (numeryczny)
+        #
+        # ∇_{r₁}J/J = (du/dr) · r̂₁₂,  shape (N, 3)
+        grad_J_over_J_r1 = du_dr[:, None] * r_hat    # (N, 3)
+        grad_J_over_J_r2 = -grad_J_over_J_r1         # ∇_{r₂}J/J = -∇_{r₁}J/J
+
+        # Gradient φ(r)/φ(r) numerycznie — 6-kierunkowy stencil
+        def grad_phi_over_phi(r):
+            """∇φ/φ, shape (N,3) — metoda różnic skończonych."""
+            phi_c = self.psi(r) + 1e-300
+            grad  = np.zeros_like(r)
+            for i, ax in enumerate([[d_phi,0,0],[0,d_phi,0],[0,0,d_phi]]):
+                ax = np.array(ax)
+                phi_plus  = self.psi(r + ax)
+                phi_minus = self.psi(r - ax)
+                grad[:, i] = (phi_plus - phi_minus) / (2 * d_phi * phi_c)
+            return grad
+
+        gphi1 = grad_phi_over_phi(r1)   # (N, 3)
+        gphi2 = grad_phi_over_phi(r2)   # (N, 3)
+
+        # Iloczyn skalarny gradientów
+        cross = 2.0 * (
+            np.sum(gphi1 * grad_J_over_J_r1, axis=-1) +
+            np.sum(gphi2 * grad_J_over_J_r2, axis=-1)
+        )  # (N,)
+
+        return lap_J_over_J, cross
+
+    # ── Główna metoda: E_L(r₁, r₂) ──────────────────────────────────────
+
+    def __call__(self, r1: np.ndarray, r2: np.ndarray) -> np.ndarray:
+        """
+        Oblicza energię lokalną dla N walkerów jednocześnie.
+
+        E_L = -ℏ²/(2m) · [ (∇²φ₁/φ₁) + (∇²φ₂/φ₂)        ← człon [A]×2
+                           + (∇²_{r₁}J/J) + (∇²_{r₂}J/J)  ← człon [B]
+                           + cross_term ]                    ← człon [C]
+            + V_ext(r₁) + V_ext(r₂)
+            + e²/(4πε·r₁₂)                                  ← Coulomb
+
+        Argumenty:
+            r1, r2 : shape (N_walkers, 3), pozycje elektronów [m]
+        Zwraca:
+            E_L : shape (N_walkers,), energie lokalne [J]
+        """
+        cfg  = self.cfg
+        hb2m = HBAR**2 / (2.0 * cfg.m_eff)   # ℏ²/(2m*) [J·m²]
+
+        # ─ Człon [A]: jednocząstkowe laplasjany ──────────────────────────
+        lap1 = self._laplacian_phi_over_phi(r1)   # ∇²φ₁/φ₁, (N,)
+        lap2 = self._laplacian_phi_over_phi(r2)   # ∇²φ₂/φ₂, (N,)
+
+        # ─ Człony [B] i [C]: poprawki od Jastrowa ────────────────────────
+        lap_J, cross = self._jastrow_kinetic_terms(r1, r2)
+
+        # Pełny człon kinetyczny
+        T = -hb2m * (lap1 + lap2 + lap_J + cross)   # (N,)
+
+        # ─ Potencjał zewnętrzny (studnia kwantowa) ────────────────────────
+        V1 = self.V_itp(r1)   # (N,)
+        V2 = self.V_itp(r2)   # (N,)
+
+        # ─ Odpychanie Coulomba ────────────────────────────────────────────
+        # V_C = e² / (4πε₀εᵣ · r₁₂)
+        # To jest FIZYCZNIE KLUCZOWE — bez tego mamy tylko 2×E_1cząstk.
+        # VMC uwzględnia ten człon DOKŁADNIE (nie perturbacyjnie).
         dr   = r1 - r2
-        r12  = np.sqrt(np.sum(dr**2, axis=-1)) + 1e-30  # (N,)
+        r12  = np.sqrt(np.sum(dr**2, axis=-1)) + 1e-30
         eps  = cfg.eps_r * EPS_0
-        V_coul = E_CHARGE**2 / (4.0 * np.pi * eps * r12)
+        V_C  = E_CHARGE**2 / (4.0 * np.pi * eps * r12)   # (N,)
 
-        E_L = T1 + T2 + V1 + V2 + V_coul
-        return E_L
+        return T + V1 + V2 + V_C
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7.  ALGORYTM METROPOLISA (W PEŁNI ZWEKTORYZOWANY)
+# ALGORYTM METROPOLISA-HASTINGSA (wektoryzowany)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class MetropolisSampler:
     """
-    Próbkowanie |Ψ(r1,r2)|² za pomocą algorytmu Metropolisa-Hastingsa.
+    Próbkuje z |Ψ(r₁,r₂)|² i zbiera próbki E_L.
 
-    Kluczowe cechy:
-    - Wszystkie N_walkers konfiguracji aktualizowane JEDNOCZEŚNIE (NumPy)
-    - Każdy walker = jedna para (r1, r2) → tensor shape (N,2,3)
-    - Propozycja: r_new = r_old + step * N(0,1)
-    - Acceptance ratio: min(1, |Ψ_new|²/|Ψ_old|²)
-    - Automatyczna kalibracja step_size do target acceptance rate
+    Dlaczego Metropolis a nie odrzucanie (rejection sampling)?
+    → |Ψ|² jest znormalizowane, ale nie znamy stałej normalizacji.
+      Metropolis wymaga tylko stosunku |Ψ_new|²/|Ψ_old|² → idealne.
+
+    Dlaczego N_walkers konfiguracji jednocześnie?
+    → Python ma wolne pętle. NumPy operuje na tablicach błyskawicznie.
+      N_walkers = 2048 → 2048-krotne przyspieszenie względem pętli po walkerach.
     """
 
     def __init__(self, trial_wf: TrialWavefunction,
@@ -260,326 +500,300 @@ class MetropolisSampler:
         self.wf  = trial_wf
         self.EL  = local_energy
         self.cfg = cfg
-        self.rng = np.random.default_rng()
+        self.rng = np.random.default_rng(seed=42)   # reprodukowalność
 
-    # ── inicjalizacja walkerów ────────────────────────────────────────────
     def _init_walkers(self, x_range, y_range, z_range) -> np.ndarray:
         """
-        Losowe startowe pozycje wewnątrz siatki.
-        Zwraca: (N, 2, 3)  —  N walkerów, 2 elektrony, 3 współrzędne
+        Losowe startowe pozycje walkerów — równomiernie wewnątrz siatki.
+        Konfiguracje z |Ψ| ≈ 0 (poza cropką) przesuwamy do centrum.
+
+        Zwraca: shape (N_walkers, 2, 3) — N konfiguracji, 2 elektrony, 3 wsp.
         """
-        N = self.cfg.n_walkers
-        def rand_in(lo, hi):
-            return self.rng.uniform(lo, hi, size=(N, 3))
+        N  = self.cfg.n_walkers
+        lo = np.array([x_range[0], y_range[0], z_range[0]])
+        hi = np.array([x_range[1], y_range[1], z_range[1]])
 
-        r1 = rand_in(*zip(x_range, y_range, z_range))
-        r2 = rand_in(*zip(x_range, y_range, z_range))
+        r1 = self.rng.uniform(lo, hi, size=(N, 3))
+        r2 = self.rng.uniform(lo, hi, size=(N, 3))
 
-        # Odrzuć konfiguracje gdzie |Ψ| ≈ 0 (oba elektrony poza kropką)
+        # Sprawdź czy walkery mają sensowne |Ψ|
         psi_vals = np.abs(self.wf(r1, r2))
         mask = psi_vals < 1e-20
         if mask.any():
-            # Przesuń "puste" walkerów do środka siatki
-            cx = 0.5 * (x_range[0] + x_range[1])
-            cy = 0.5 * (y_range[0] + y_range[1])
-            cz = 0.5 * (z_range[0] + z_range[1])
-            center = np.array([cx, cy, cz])
-            r1[mask] = center + self.rng.uniform(-1e-10, 1e-10, (mask.sum(), 3))
+            center = 0.5 * (lo + hi)
+            noise  = self.rng.uniform(-1e-10, 1e-10, (mask.sum(), 3))
+            r1[mask] = center + noise
             r2[mask] = center + self.rng.uniform(-1e-10, 1e-10, (mask.sum(), 3))
 
         return np.stack([r1, r2], axis=1)   # (N, 2, 3)
 
-    # ── jeden krok Metropolisa dla wszystkich walkerów ────────────────────
     def _step(self, walkers: np.ndarray,
               log_prob_old: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
         """
-        walkers:      (N, 2, 3)
-        log_prob_old: (N,)   = 2·log|Ψ_old|
+        Jeden krok Metropolisa dla WSZYSTKICH walkerów jednocześnie.
 
-        Zwraca:
-          walkers_new (N,2,3), log_prob_new (N,), acceptance_rate (float)
+        Propozycja: r' = r + δ·η,  η ~ N(0,1) (symetryczna → Metropolis, nie M-H)
+        Acceptance ratio: A = |Ψ(r'₁,r'₂)|²/|Ψ(r₁,r₂)|² = exp(log|Ψ'|² - log|Ψ|²)
+
+        W przestrzeni log: akceptuj jeśli log(A) > log(U), U ~ Uniform[0,1].
         """
-        N   = self.cfg.n_walkers
-        s   = self.cfg.step_size
+        N = self.cfg.n_walkers
+        s = self.cfg.step_size
 
-        # Propozycja: każdy elektron dostaje niezależną propozycję
-        proposal = walkers + s * self.rng.standard_normal((N, 2, 3))
+        proposal     = walkers + s * self.rng.standard_normal((N, 2, 3))
+        r1_new, r2_new = proposal[:, 0, :], proposal[:, 1, :]
 
-        r1_new = proposal[:, 0, :]
-        r2_new = proposal[:, 1, :]
         log_prob_new = self.wf.log_abs_sq(r1_new, r2_new)
+        log_ratio    = log_prob_new - log_prob_old           # log A
+        accept       = log_ratio >= np.log(self.rng.uniform(0, 1, N) + 1e-300)
 
-        # Acceptance ratio w przestrzeni logarytmicznej (numerycznie stabilne)
-        log_ratio = log_prob_new - log_prob_old         # (N,)
-        u = np.log(self.rng.uniform(0, 1, N) + 1e-300)
-        accept = log_ratio >= u                         # (N,) bool
-
-        # Aktualizacja wektorowa — bez pętli
+        # Wektorowa aktualizacja: gdzie accept=False, zostaw stare
         walkers_new  = np.where(accept[:, None, None], proposal, walkers)
         log_prob_out = np.where(accept, log_prob_new, log_prob_old)
 
-        acc_rate = accept.mean()
-        return walkers_new, log_prob_out, float(acc_rate)
+        return walkers_new, log_prob_out, float(accept.mean())
 
-    # ── pełna procedura VMC ───────────────────────────────────────────────
     def run(self, x_range, y_range, z_range) -> dict:
         """
         Główna pętla VMC.
 
-        Zwraca słownik:
-          energy_mean  [eV]
-          energy_std   [eV]
-          energy_err   [eV]   (błąd średniej = std/sqrt(N_eff))
-          acceptance_rate
-          energies_raw [J]    (próbki do analizy)
+        Faza 1 — Termalizacja (warmup):
+            Walkerzy "zapominają" o startowych pozycjach i zbiegają
+            do obszarów o dużym |Ψ|². Wyniki tej fazy są odrzucane.
+            Adaptacyjna kalibracja δ dąży do target acceptance rate.
+
+        Faza 2 — Produkcja:
+            Zbieramy E_L(r₁,r₂) dla każdego kroku.
+            <E> = mean(E_L),  σ_E = std(E_L)/√N_eff
+
+        Zwraca dict z wynikami w eV.
         """
         cfg = self.cfg
 
-        # ── inicjalizacja ────────────────────────────────────────────────
         walkers  = self._init_walkers(x_range, y_range, z_range)
         r1, r2   = walkers[:, 0, :], walkers[:, 1, :]
         log_prob = self.wf.log_abs_sq(r1, r2)
 
-        # ── rozgrzewka (thermalization) ──────────────────────────────────
+        # ── Termalizacja ─────────────────────────────────────────────────
         if cfg.verbose:
-            print(f"🔥 Rozgrzewka: {cfg.n_warmup} kroków × {cfg.n_walkers} walkerów")
+            print(f"🔥 Termalizacja: {cfg.n_warmup} kroków × {cfg.n_walkers} walkerów")
 
         for step in range(cfg.n_warmup):
             walkers, log_prob, ar = self._step(walkers, log_prob)
 
-            # Adaptacyjna kalibracja kroku
             if cfg.adaptive_step and step % 50 == 49:
+                # Zwiększaj krok gdy za często akceptujemy (za mały zasięg)
+                # Zmniejszaj gdy zbyt rzadko (za duże skoki)
                 if ar > cfg.target_ar + 0.05:
                     cfg.step_size *= 1.1
                 elif ar < cfg.target_ar - 0.05:
                     cfg.step_size *= 0.9
 
         if cfg.verbose:
-            print(f"   step_size po kalibracji: {cfg.step_size:.3e} m")
+            print(f"   Krok po kalibracji: {cfg.step_size:.3e} m")
 
-        # ── produkcja ────────────────────────────────────────────────────
+        # ── Produkcja ────────────────────────────────────────────────────
         if cfg.verbose:
             print(f"⚛️  Produkcja: {cfg.n_steps} kroków...")
 
-        t0 = time.time()
         energies = []
         ar_acc   = []
+        t0 = time.time()
 
-        for step in range(cfg.n_steps):
+        for _ in range(cfg.n_steps):
             walkers, log_prob, ar = self._step(walkers, log_prob)
             ar_acc.append(ar)
 
             r1, r2 = walkers[:, 0, :], walkers[:, 1, :]
-            E_L = self.EL(r1, r2, self.wf)           # (N,)
+            E_L    = self.EL(r1, r2)   # (N_walkers,)
 
-            # Odcinamy wartości odstające (|E_L| > 10×median) — stabilność
+            # Usuwamy skrajne wartości: E_L >> median wskazuje na walker
+            # blisko węzła φ (dzielenie przez 0 w ∇²φ/φ)
             E_median = np.median(np.abs(E_L))
-            mask_ok  = np.abs(E_L) < 10.0 * E_median
-            energies.append(E_L[mask_ok].mean())
+            E_L_clean = E_L[np.abs(E_L) < 10.0 * E_median]
 
-        elapsed = time.time() - t0
+            if len(E_L_clean) > 0:
+                energies.append(E_L_clean.mean())
 
-        energies = np.array(energies)                 # (n_steps,)
-        E_J      = energies.mean()
-        E_eV     = E_J / E_CHARGE
-        std_eV   = energies.std() / E_CHARGE
-        N_eff    = len(energies)
-        err_eV   = std_eV / np.sqrt(N_eff)
+        elapsed  = time.time() - t0
+        energies = np.array(energies)
 
+        E_J    = energies.mean()
+        E_eV   = E_J / E_CHARGE
+        std_eV = energies.std() / E_CHARGE
+        err_eV = std_eV / np.sqrt(len(energies))
         mean_ar = float(np.mean(ar_acc))
 
         if cfg.verbose:
-            print(f"\n{'─'*50}")
-            print(f"  <E>  = {E_eV:.4f} ± {err_eV:.4f} eV")
-            print(f"  Std  = {std_eV:.4f} eV")
-            print(f"  Acceptance rate = {mean_ar:.2%}")
-            print(f"  Czas produkcji  = {elapsed:.1f} s")
-            print(f"{'─'*50}")
+            print(f"\n{'─'*52}")
+            print(f"  <E>            = {E_eV:.4f} ± {err_eV:.4f} eV")
+            print(f"  Odch. stand.   = {std_eV:.4f} eV")
+            print(f"  Acceptance rate= {mean_ar:.1%}")
+            print(f"  Czas produkcji = {elapsed:.1f} s")
+            print(f"{'─'*52}")
 
         return {
-            "energy_mean": E_eV,
-            "energy_std":  std_eV,
-            "energy_err":  err_eV,
+            "energy_mean":     E_eV,
+            "energy_std":      std_eV,
+            "energy_err":      err_eV,
             "acceptance_rate": mean_ar,
-            "energies_raw": energies,
-            "elapsed_s":   elapsed,
+            "energies_raw":    energies,   # [J], do dalszej analizy
+            "elapsed_s":       elapsed,
         }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8.  OPTYMALIZACJA PARAMETRÓW JASTROWA  (prosta metoda gradientowa)
+# OPTYMALIZACJA PARAMETRU JASTROWA α
 # ─────────────────────────────────────────────────────────────────────────────
 
-def optimize_jastrow(base_cfg: VMCConfig, psi_itp, V_itp,
-                     eigval, x, y, z,
-                     alpha_range=(0.1, 2.0), n_points=8) -> Tuple[float, float]:
+def optimize_jastrow(base_cfg: VMCConfig, psi_itp: PsiInterpolator,
+                     V_itp, x, y, z,
+                     alpha_range=(0.5e9, 5e9), n_points=8) -> Tuple[float, float]:
     """
-    Skanuje alpha w podanym zakresie i wybiera minimum <E>.
-    Szybka wersja: zmniejszony n_steps podczas skanu.
+    Skanuje α w podanym zakresie i wybiera wartość minimalizującą <E>.
+
+    Matematyczne uzasadnienie (Zasada Wariacyjna):
+        Dla KAŻDEGO Ψ_trial:  <Ψ_trial|Ĥ|Ψ_trial> ≥ E_0
+    Zatem minimalizacja <E> po α daje najlepsze przybliżenie energii stanu
+    podstawowego w przyjętej rodzinie funkcji próbnych.
+
+    Uwagi:
+    - alpha_range w [1/m]: α ~ 1/(2·a_B*) gdzie a_B* = bohrowski promień
+      efektywny w GaAs ≈ 10 nm → α ~ 5×10⁷ m⁻¹
+    - Podczas skanowania używamy mniejszego n_steps dla szybkości
+
+    Zwraca: (best_alpha, best_energy_eV)
     """
     from copy import deepcopy
     alphas   = np.linspace(alpha_range[0], alpha_range[1], n_points)
     energies = []
 
-    print(f"\n🔍 Optymalizacja alpha Jastrowa ({n_points} punktów)...")
-
-    for a in alphas:
-        cfg = deepcopy(base_cfg)
-        cfg.jastrow_alpha = a
-        cfg.n_warmup = 100
-        cfg.n_steps  = 500
-        cfg.verbose  = False
-
-        trial = TrialWavefunction(psi_itp, cfg)
-        E_itp = _build_V_itp(V_itp, x, y, z)
-        loc_e = LocalEnergy(psi_itp, E_itp, cfg, eigval)
-        sampler = MetropolisSampler(trial, loc_e, cfg)
-
-        x_range = (x[0], x[-1])
-        y_range = (y[0], y[-1])
-        z_range = (z[0], z[-1])
-
-        res = sampler.run(x_range, y_range, z_range)
-        energies.append(res["energy_mean"])
-        print(f"   alpha={a:.2f}  →  <E>={res['energy_mean']:.4f} eV")
-
-    best_i = int(np.argmin(energies))
-    best_alpha = float(alphas[best_i])
-    print(f"✅ Optymalne alpha = {best_alpha:.3f}  (<E> = {energies[best_i]:.4f} eV)")
-    return best_alpha, float(energies[best_i])
-
-
-def _build_V_itp(V: np.ndarray, x, y, z):
-    """Buduje interpolator potencjału V (pomocnicza funkcja)."""
-    return si.RegularGridInterpolator(
-        (x, y, z), V,
-        method="linear", bounds_error=False, fill_value=float(V.max())
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 9.  GŁÓWNA FUNKCJA INTEGRUJĄCA Z SOLVEREM FDM
-# ─────────────────────────────────────────────────────────────────────────────
-
-def run_vmc(
-    psi:     np.ndarray,       # z solvera FDM, shape (nx,ny,nz)
-    V:       np.ndarray,       # potencjał zewnętrzny, shape (nx,ny,nz)
-    x:       np.ndarray,       # oś x [m]
-    y:       np.ndarray,       # oś y [m]
-    z:       np.ndarray,       # oś z [m]
-    eigval:  float,            # energia własna [J] z solvera
-    cfg:     Optional[VMCConfig] = None,
-    optimize_alpha: bool = False,
-) -> dict:
-    """
-    Punkt wejścia. Wywołaj po rozwiązaniu równania Schrödingera:
-
-        from vmc_module import run_vmc, VMCConfig
-        cfg = VMCConfig(n_walkers=4096, n_steps=8000)
-        result = run_vmc(psi, V, x, y, z, eigvals[0], cfg)
-        print(f"Energia dwóch elektronów: {result['energy_mean']:.4f} eV")
-    """
-    if cfg is None:
-        cfg = VMCConfig()
+    print(f"\n🔍 Optymalizacja α Jastrowa ({n_points} punktów)...")
 
     x_range = (x[0], x[-1])
     y_range = (y[0], y[-1])
     z_range = (z[0], z[-1])
 
-    # ── interpolatory ────────────────────────────────────────────────────
+    for a in alphas:
+        cfg             = deepcopy(base_cfg)
+        cfg.jastrow_alpha = float(a)
+        cfg.n_warmup    = 100
+        cfg.n_steps     = 500
+        cfg.verbose     = False
+
+        trial   = TrialWavefunction(psi_itp, cfg)
+        loc_e   = LocalEnergy(psi_itp, V_itp, cfg)
+        sampler = MetropolisSampler(trial, loc_e, cfg)
+        res     = sampler.run(x_range, y_range, z_range)
+
+        energies.append(res["energy_mean"])
+        print(f"   α = {a:.3e} m⁻¹  →  <E> = {res['energy_mean']:.4f} eV")
+
+    best_i     = int(np.argmin(energies))
+    best_alpha = float(alphas[best_i])
+    print(f"✅ Optymalne α = {best_alpha:.3e} m⁻¹  (<E> = {energies[best_i]:.4f} eV)")
+    return best_alpha, float(energies[best_i])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PUNKT WEJŚCIA — integracja z solverem FDM
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_V_itp(V: np.ndarray, x, y, z):
+    """Pomocnicza: buduje interpolator potencjału zewnętrznego."""
+    return si.RegularGridInterpolator(
+        (x, y, z), V,
+        method="linear",
+        bounds_error=False,
+        fill_value=float(V.max()),   # poza siatką → bariera (najwyższy potencjał)
+    )
+
+
+def run_vmc(
+    psi:    np.ndarray,   # jednocząstkowa f. falowa z FDM, shape (nx,ny,nz)
+    V:      np.ndarray,   # potencjał zewnętrzny [J], shape (nx,ny,nz)
+    x:      np.ndarray,   # oś x [m]
+    y:      np.ndarray,   # oś y [m]
+    z:      np.ndarray,   # oś z [m]
+    eigval: float,        # energia własna 1-cząstkowa [J] (do porównania)
+    cfg:    Optional[VMCConfig] = None,
+    optimize_alpha: bool = False,   # True = wolniej, ale lepsza α
+) -> dict:
+    """
+    Główna funkcja — wywołaj po rozwiązaniu równania Schrödingera FDM.
+
+    Interpretacja wyniku:
+        result['energy_mean']  = <E₂e>  [eV]  — energia układu dwóch elektronów
+        2 × eigval_eV          = 2×E₁e  [eV]  — energia bez korelacji
+        Różnica                           [eV]  — korekta korelacyjna (zawiera
+                                                  ΔT_korel + ΔV_C)
+    """
+    if cfg is None:
+        cfg = VMCConfig()
+
+    x_range = (float(x[0]), float(x[-1]))
+    y_range = (float(y[0]), float(y[-1]))
+    z_range = (float(z[0]), float(z[-1]))
+
     psi_itp = PsiInterpolator(psi, x, y, z)
     V_itp   = _build_V_itp(V, x, y, z)
 
-    # ── opcjonalna optymalizacja Jastrowa ────────────────────────────────
     if optimize_alpha:
-        best_alpha, _ = optimize_jastrow(cfg, psi_itp, V_itp, eigval, x, y, z)
+        best_alpha, _ = optimize_jastrow(cfg, psi_itp, V_itp, x, y, z)
         cfg.jastrow_alpha = best_alpha
 
-    # ── składanie obiektów ───────────────────────────────────────────────
     trial   = TrialWavefunction(psi_itp, cfg)
-    loc_e   = LocalEnergy(psi_itp, V_itp, cfg, eigval)
+    loc_e   = LocalEnergy(psi_itp, V_itp, cfg)
     sampler = MetropolisSampler(trial, loc_e, cfg)
 
+    eigval_eV = eigval / E_CHARGE
+
     if cfg.verbose:
-        E_ref_eV = eigval / E_CHARGE
-        print(f"\n{'═'*50}")
-        print(f"  VMC — GaAs/AlAs Quantum Dot")
-        print(f"  Energia 1-cząstkowa (FDM): {E_ref_eV:.4f} eV")
-        print(f"  Walkerów:  {cfg.n_walkers}")
-        print(f"  Kroków:    {cfg.n_steps}")
-        print(f"  α Jastrowa: {cfg.jastrow_alpha:.3f}")
-        print(f"{'═'*50}\n")
+        print(f"\n{'═'*52}")
+        print(f"  VMC — GaAs/AlAs Quantum Dot, 2 elektrony")
+        print(f"  E₁e (FDM):   {eigval_eV:.4f} eV")
+        print(f"  2×E₁e:       {2*eigval_eV:.4f} eV  (bez korelacji)")
+        print(f"  Walkerów:    {cfg.n_walkers}")
+        print(f"  Kroków:      {cfg.n_steps}")
+        print(f"  α Jastrowa:  {cfg.jastrow_alpha:.3e} m⁻¹")
+        print(f"{'═'*52}\n")
 
     result = sampler.run(x_range, y_range, z_range)
-    result["eigval_1p_eV"] = eigval / E_CHARGE
+    result["eigval_1p_eV"]  = eigval_eV
     result["jastrow_alpha"] = cfg.jastrow_alpha
+
+    if cfg.verbose:
+        corr = result["energy_mean"] - 2.0 * eigval_eV
+        print(f"\n🎯 Energia 2e:     {result['energy_mean']:.4f} ± {result['energy_err']:.4f} eV")
+        print(f"   Korekta korel.: {corr:+.4f} eV  (= V_Coulomb + ΔT_kinet)")
 
     return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 10.  PRZYKŁAD INTEGRACJI Z TWOIM KODEM (wklej na koniec solver FDM)
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# ── Po linii z: eigvals, eigvecs = spla.eigsh(H, k=3, which='SA') ──
-#
-#   from vmc_module import run_vmc, VMCConfig
-#
-#   cfg = VMCConfig(
-#       n_walkers     = 4096,     # więcej = dokładniej, ale wolniej
-#       n_steps       = 10000,
-#       jastrow_alpha = 0.5,      # lub optimize_alpha=True
-#       jastrow_beta  = 1.0,
-#       step_size     = 2e-10,    # ≈ 0.4 * dx
-#       adaptive_step = True,
-#       verbose       = True,
-#   )
-#
-#   result = run_vmc(
-#       psi    = psi,             # już znormalizowane (nx,ny,nz)
-#       V      = V,               # potencjał z solvera (nx,ny,nz) [J]
-#       x      = x,              # np.arange(nx)*dx - cx*dx
-#       y      = y,
-#       z      = z,
-#       eigval = eigvals[0],      # [J]
-#       cfg    = cfg,
-#       optimize_alpha = False,   # True = ~8x dłużej, ale lepszy Jastrow
-#   )
-#
-#   print(f"\n🎯  <E_2e> = {result['energy_mean']:.4f} ± {result['energy_err']:.4f} eV")
-#   print(f"    Korekta korelacyjna vs 2×E_1e: "
-#         f"{result['energy_mean'] - 2*result['eigval_1p_eV']:.4f} eV")
-#
+# SZYBKI TEST (bez solvera FDM — gaussowska funkcja próbna)
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # ── Szybki test modułu (bez solvera FDM) ────────────────────────────
-    # Symulujemy gaussowską funkcję falową w pudełku 25x25x25 nm
-    print("=== Szybki test VMC (Gaussian mock) ===\n")
+    print("=== Test VMC (Gaussian mock, bez solvera FDM) ===\n")
 
     nx = ny = nz = 30
     dx = 0.5e-9
-    cx, cy, cz = nx//2, ny//2, nz//2
-    x = (np.arange(nx) - cx) * dx
-    y = (np.arange(ny) - cy) * dx
-    z = (np.arange(nz) - cz) * dx
+    x = (np.arange(nx) - nx//2) * dx
+    y = (np.arange(ny) - ny//2) * dx
+    z = (np.arange(nz) - nz//2) * dx
     X, Y, Z = np.meshgrid(x, y, z, indexing="ij")
 
-    sigma = 5e-9
+    sigma    = 5e-9
     psi_mock = np.exp(-(X**2 + Y**2 + Z**2) / (2 * sigma**2))
-    norm = np.sqrt(np.sum(psi_mock**2) * dx**3)
-    psi_mock /= norm
+    psi_mock /= np.sqrt(np.sum(psi_mock**2) * dx**3)
 
-    V_mock = np.zeros_like(psi_mock)
-    R = 10 * dx
-    outside = (X**2 + Y**2 + Z**2) > R**2
-    V_mock[outside] = 1.0 * 1.602e-19   # 1 eV bariera
-
-    E_mock = 0.1 * 1.602e-19   # 0.1 eV energia próbna
+    V_mock  = np.zeros_like(psi_mock)
+    outside = (X**2 + Y**2 + Z**2) > (10*dx)**2
+    V_mock[outside] = 1.0 * E_CHARGE   # bariera 1 eV
 
     cfg = VMCConfig(
-        n_walkers=256, n_steps=200, n_warmup=50, verbose=True
+        n_walkers=256, n_steps=300, n_warmup=100,
+        jastrow_alpha=1e8,   # typowe α dla GaAs w jednostkach SI [1/m]
+        verbose=True,
     )
-
-    result = run_vmc(psi_mock, V_mock, x, y, z, E_mock, cfg)
-    print(f"\n✅  Test zakończony. <E> = {result['energy_mean']:.4f} eV")

@@ -1,0 +1,130 @@
+Wyniki przeprowadzonych symulacji VMC
+=====================================
+
+Parametry wspólne
+-----------------
+- Materiał: GaAs/AlAs
+- Energia jednocząstkowa:
+    E_1e = 0.0923 eV
+- Energia bez oddziaływań:
+    2 * E_1e = 0.1846 eV
+- Liczba walkerów:
+    2048
+- Liczba kroków produkcyjnych:
+    5000
+- jastrow_alpha:
+    1e8
+- Interpolacja:
+    cubic
+
+============================================================
+1. Wyniki dla adaptive_step = True
+============================================================
+
+step_size = 2e-10 m
+--------------------------------
+Energia:
+    E = 0.2179 ± 0.0004 eV
+Acceptance rate:
+    80.3%
+
+step_size = 4e-10 m
+--------------------------------
+Energia:
+    E = 0.2081 ± 0.0000 eV
+Acceptance rate:
+    62.7%
+
+step_size = 6e-10 m
+--------------------------------
+Energia:
+    E = 0.2079 ± 0.0000 eV
+Acceptance rate:
+    51.1%
+
+step_size = 8e-10 m
+--------------------------------
+Energia:
+    E = 0.2078 ± 0.0000 eV
+Acceptance rate:
+    51.0%
+
+step_size = 1e-9 m
+--------------------------------
+Energia:
+    E = 0.2079 ± 0.0000 eV
+Acceptance rate:
+    49.7%
+
+Wnioski
+--------
+- Adaptive step automatycznie stabilizuje efektywny krok Monte Carlo.
+- Wyniki szybko zbiegają do stabilnej energii:
+      E ≈ 0.208 eV
+- Dla większych kroków energia praktycznie przestaje się zmieniać.
+- Mechanizm adaptive_step działa poprawnie i poprawia stabilność obliczeń.
+
+============================================================
+2. Wyniki dla adaptive_step = False
+============================================================
+
+step_size = 2e-10 m
+--------------------------------
+Energia:
+    E = 0.3982 ± 0.0034 eV
+Acceptance rate:
+    90.1%
+
+step_size = 4e-10 m
+--------------------------------
+Energia:
+    E = 0.2222 ± 0.0004 eV
+Acceptance rate:
+    84.6%
+
+step_size = 6e-10 m
+--------------------------------
+Energia:
+    E = 0.2092 ± 0.0001 eV
+Acceptance rate:
+    77.7%
+
+step_size = 8e-10 m
+--------------------------------
+Energia:
+    E = 0.2079 ± 0.0000 eV
+Acceptance rate:
+    70.7%
+
+step_size = 1e-9 m
+--------------------------------
+Energia:
+    E = 0.2078 ± 0.0000 eV
+Acceptance rate:
+    63.9%
+
+Wnioski
+--------
+- Dla małych kroków Monte Carlo pojawia się bardzo wysoki acceptance rate
+  oraz zawyżona energia układu.
+- Układ słabo próbuje przestrzeń konfiguracji dla małych step_size.
+- Stabilna zbieżność pojawia się dopiero dla:
+      step_size >= 8e-10 m
+- Najbardziej wiarygodna energia końcowa:
+      E ≈ 0.208 eV
+
+============================================================
+Końcowy wynik projektu
+============================================================
+
+Najbardziej stabilny i fizycznie wiarygodny wynik:
+
+    E_2e ≈ 0.208 eV
+
+Korekta korelacyjna względem przypadku bez oddziaływań:
+
+    ΔE ≈ +0.023 eV
+
+Najlepszy zakres acceptance rate:
+
+    50% – 70%

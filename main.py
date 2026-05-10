@@ -1,4 +1,3 @@
-
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
@@ -23,18 +22,55 @@ def main():
     # 2. Konfiguracja Twojego silnika VMC
     from vmc_engine import run_vmc, VMCConfig
     
-    cfg = VMCConfig(
-        n_walkers = 2048, 
-        n_steps = 5000,
-        verbose = True
-    )
+    #cfg = VMCConfig(
+    #    n_walkers = 2048, 
+    #    n_steps = 5000,
+    #    verbose = True
+    #)
 
     # 3. Odpalenie obliczeń
     # Przekazujemy psi, V oraz siatkę x, y, z
-    result = run_vmc(psi, V, x, y, z, energies[0], cfg)
+    #result = run_vmc(psi, V, x, y, z, energies[0], cfg)
 
-    print(f"\n🎯 FINALNY WYNIK:")
-    print(f"Energia stanu podstawowego (2e): {result['energy_mean']:.4f} eV")
+    #print(f"\n🎯 FINALNY WYNIK:")
+    #print(f"Energia stanu podstawowego (2e): {result['energy_mean']:.4f} eV")
+    step_sizes = [1e-9]
+
+    results = []
+
+    for step in step_sizes:
+
+        print("\n" + "="*70)
+        print(f"TEST step_size = {step:.2e} m")
+        print("="*70)
+
+        cfg = VMCConfig(
+            n_walkers = 2048,
+            n_steps = 5000,
+            n_warmup = 500,
+            step_size = step,
+            adaptive_step = False,
+            jastrow_alpha = 1e8,
+            verbose = True
+        )
+
+        result = run_vmc(psi,V,x,y,z,energies[0],cfg)
+
+        results.append({
+            "step_size": step,
+            "energy": result["energy_mean"],
+            "error": result["energy_err"],
+            "acceptance": result["acceptance_rate"]
+        })
+
+    print("\n\n===== PODSUMOWANIE =====")
+
+    for r in results:
+        print(
+            f"step={r['step_size']:.2e} m | "
+            f"E={r['energy']:.4f} ± {r['error']:.6f} eV | "
+            f"AR={100*r['acceptance']:.1f}%"
+        )
 
 # =========================
 # NANOSTRUCTURE
@@ -96,7 +132,7 @@ def Nanostructure():
 
                 rows.append(p)
                 cols.append(p)
-                data.append(-6 * coeff[p])
+                data.append(+6 * coeff[p]) 
 
                 cp = coeff[p]
 
@@ -106,7 +142,7 @@ def Nanostructure():
                         q = idx(ni,nj,nk)
                         rows.append(p)
                         cols.append(q)
-                        data.append(cp)
+                        data.append(-cp)
 
     H = sp.csr_matrix((data, (rows, cols)), shape=(N, N)) + sp.diags(V_flat)
 
@@ -115,7 +151,7 @@ def Nanostructure():
     eigvals, eigvecs = spla.eigsh(H, k=3, which='SA')
 
     e = 1.602e-19
-    eigvals_eV = eigvals / e
+    eigvals_J = eigvals  # usunąłem /e bo mi sę jednostki nie zgadzały 
 
     # NORMALIZE
     def normalize(psi):
@@ -128,7 +164,7 @@ def Nanostructure():
     # SAVE (opcjonalnie)
     np.savetxt(os.path.join(output_dir, "energies.dat"), eigvals)
 
-    return eigvals_eV, psi, V, x, y, z,
+    return eigvals_J, psi, V, x, y, z,
 
 # =========================
 # COULOMB
