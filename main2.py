@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import os
 from Ci_engine import run_ci, CIConfig # type: ignore
 
+
 # =========================
 # MAIN
 # =========================
@@ -39,6 +40,7 @@ def main():
 # =========================
 def Nanostructure():
 
+    
     output_dir = os.path.abspath("wyniczek")
     os.makedirs(output_dir, exist_ok=True)
 
@@ -128,6 +130,54 @@ def Nanostructure():
     print(f"\nEnergie jednocząstkowe (pierwsze {n_eig}):")
     for i, ev in enumerate(eigvals):
         print(f"  ε_{i} = {ev/e_charge:.4f} eV")
+    # =========================
+    # WAVEFUNCTION
+    # =========================
+    def normalize(psi):
+        norm = np.sum(np.abs(psi)**2) * dx**3
+        return psi / np.sqrt(norm)
+
+    # =========================
+    # VISUALIZATION (BLACK BACKGROUND PNG)
+    # =========================
+
+    psi = eigvecs[:, 0].reshape((nx, ny, nz))
+    psi = normalize(psi)
+    psi2 = np.abs(psi)**2
+
+    # =========================
+    # SAVE .DAT FILES WITH FULL HEADERS
+    # =========================
+    print("💾 Saving .dat files...")
+
+    grid_data = np.column_stack([
+        X.flatten(), Y.flatten(), Z.flatten(),
+        psi.real.flatten(), psi.imag.flatten(),
+        psi2.flatten(), V.flatten(), meff.flatten()
+    ])
+
+    def save(fig, name):
+        fig.savefig(os.path.join(output_dir, name), dpi=300, bbox_inches="tight", facecolor='black')
+        plt.close(fig)
+
+    fig = plt.figure(facecolor='black')
+    plt.imshow(psi2[:, :, cz].T, origin="lower", cmap="Oranges")
+    plt.colorbar()
+    plt.title("GaAs/AlAs density XY")
+    save(fig, "xy.png")
+
+    fig = plt.figure(facecolor='black')
+    plt.imshow(psi2[:, cy, :].T, origin="lower", cmap="Oranges")
+    plt.colorbar()
+    plt.title("GaAs/AlAs density XZ")
+    save(fig, "xz.png")
+
+    fig = plt.figure(facecolor='black')
+    proj = np.sum(psi2, axis=2)
+    plt.imshow(proj.T, origin="lower", cmap="Oranges")
+    plt.colorbar()
+    plt.title("Projection Z")
+    save(fig, "proj.png")
 
     return eigvals, eigvecs, V, x, y, z, nx, ny, nz
 
