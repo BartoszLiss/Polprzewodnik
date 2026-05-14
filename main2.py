@@ -120,7 +120,7 @@ def Nanostructure():
 
     # NORMALIZE każdy wektor osobno
     for k in range(eigvecs.shape[1]):
-        norm = np.sqrt(np.sum(eigvecs[:, k]**2) * dx**3)
+        norm = np.sqrt(np.sum(eigvecs[:, k]**2) * dx**3) #usunąć 
         eigvecs[:, k] /= norm
 
     # SAVE
