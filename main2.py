@@ -41,7 +41,7 @@ def main():
 def Nanostructure():
 
     
-    output_dir = os.path.abspath("wyniczek")
+    output_dir = os.path.abspath("wyniczek_trojkat")
     os.makedirs(output_dir, exist_ok=True)
 
     # GRID
@@ -62,12 +62,66 @@ def Nanostructure():
     me = 9.109e-31
 
     # GEOMETRY
-    def dot_mask(X, Y, Z):
-        R  = 20 * dx
-        Hh = 10 * dx
-        return (X**2 / R**2 + Y**2 / R**2 + Z**2 / Hh**2) <= 1
 
-    inside = dot_mask(X, Y, Z)
+    # #soczewka
+    # def dot_mask(X, Y, Z):
+    #     R  = 20 * dx
+    #     Hh = 10 * dx
+    #     return (X**2 / R**2 + Y**2 / R**2 + Z**2 / Hh**2) <= 1
+    #
+    # inside = dot_mask(X, Y, Z)
+    #
+
+
+
+    #
+    #
+    #
+    # #cylinder
+    # def dot_mask_cylinder(X, Y, Z):
+    #     R = 20 * dx     # promień
+    #     H = 20 * dx     # wysokość
+    #
+    #     return ((X**2 + Y**2) <= R**2) & (np.abs(Z) <= H/2)
+    # inside = dot_mask_cylinder(X, Y, Z)
+    #
+
+
+
+
+
+
+
+
+
+    #trójkąt
+    def dot_mask_triangle(X, Y, Z):
+        H = 20 * dx      # wysokość piramidy
+        L = 40 * dx      # bok podstawy
+
+        # wysokość trójkąta równobocznego
+        h_tri = np.sqrt(3) * L / 2
+
+        # skala przekroju maleje z wysokością
+        scale = np.clip(1 - Z/H, 0, 1)
+
+        Xs = X / scale
+        Ys = Y / scale
+
+        inside_triangle = (
+            (Ys >= -h_tri/3) &
+            (Ys <= 2*h_tri/3) &
+            (Ys <= np.sqrt(3)*Xs + 2*h_tri/3) &
+            (Ys <= -np.sqrt(3)*Xs + 2*h_tri/3)
+        )
+
+        return (Z >= 0) & (Z <= H) & inside_triangle
+    inside = dot_mask_triangle(X, Y, Z)
+
+
+
+
+
 
     # MATERIAL
     m_GaAs = 0.067 * me
